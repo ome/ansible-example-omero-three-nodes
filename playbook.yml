@@ -10,9 +10,46 @@
       include_vars: "{{ ansible_facts['os_family'] | lower }}.yml"
       when: ansible_facts['os_family'] == "Debian"
 
-- hosts: omero-database
+# gather cross-host vars
+- hosts: all
+  tasks:
+    - name: Get omero IP addresses
+      set_fact:
+        omero_database_address: >-
+          {{ hostvars[groups['omero_database'][0]].ansible_default_ipv4.address }}
+        omero_server_address: >-
+            {{ hostvars[groups['omero_server'][0]].ansible_default_ipv4.address }}
+        omero_web_address: >-
+            {{ hostvars[groups['omero_web'][0]].ansible_default_ipv4.address }}
+
+- hosts: omero_database
   roles:
     - role: ome.postgresql
+    - role: ome.iptables_raw
+
+  tasks:
+    # Allow:
+    # - all established/related in/out
+    # - all internal localhost connections
+    # - all internal traffic
+    # - ICMP echo (ping)
+    # - ssh incoming connections
+    # - server to database connection
+    - name: Iptables allow server to database connection
+      become: yes
+      iptables_raw_25:
+        name: database_accept
+        keep_unmanaged: no
+        rules: |
+          -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          -A INPUT -i lo -j ACCEPT
+          -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+          -A INPUT -p tcp -m tcp --dport 22 -j ACCEPT
+          -A INPUT -p tcp --dport 5432 -s {{ omero_server_address }} -j ACCEPT          
+        state: present
+        # Highest priority
+        weight: 0
 
   vars:
     postgresql_server_listen: "'*'"
@@ -28,17 +65,17 @@
         databases: [omero]
     postgresql_version: "11"
 
-- hosts: omero-server
+- hosts: omero_server
   roles:
     - role: ome.omero_server
 
   vars:
-    omero_server_dbhost: >-
-      {{ hostvars['omero-database'].ansible_eth0.ipv4.address }}
+    omero_server_dbhost: "{{ omero_database_address }}"
     postgresql_version: "11"
+    omero_server_dbuser: omero
+    omero_server_dbpassword: omero
 
-
-- hosts: omero-web
+- hosts: omero_web
   roles:
     - role: ome.basedeps
     - role: ome.omero_web
@@ -46,5 +83,32 @@
   vars:
     omero_web_config_set:
       omero.web.server_list:
-        - ["{{ hostvars['omero-server'].ansible_eth0.ipv4.address }}",
-           4064, omero]
+        - ["{{ omero_server_address }}", 4064, omero]
+
+- hosts: omero_server omero_web
+  roles:
+    - role: ome.iptables_raw
+
+  tasks:
+    # Allow:
+    # - all established/related in/out
+    # - all internal localhost connections
+    # - all internal traffic
+    # - ICMP echo (ping)
+    # - ssh incoming connections
+    # - Public omero ports
+    - name: Iptables ssh and related
+      become: yes
+      iptables_raw_25:
+        name: default_and_omero_external
+        keep_unmanaged: no
+        rules: |
+          -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          -A INPUT -i lo -j ACCEPT
+          -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+          -A INPUT -p tcp -m tcp --dport 22 -j ACCEPT
+          -A INPUT -p tcp -m multiport --dports 80,443,4063,4064 -j ACCEPT
+        state: present
+        # Highest priority
+        weight: 0
